@@ -11,7 +11,7 @@ st.set_page_config(
     page_title="BtcTurk AI & AquiverAI 7/24 Bot (TRY)", layout="wide"
 )
 
-st.title("📈 BtcTurk Canlı Analiz & 7/24 Otomatik AquiverAI Botu (TRY - Çeşitlendirilmiş)")
+st.title("📈 BtcTurk Canlı Analiz & 7/24 Otomatik AquiverAI Botu (TRY - Dinamik Risk)")
 
 # --- VERİTABANI KURULUMU VE YÖNETİMİ ---
 DB_FILE = "aquiver_bot_try.db"
@@ -216,7 +216,7 @@ def run_aquiver_bot_cycle():
                 )
                 balance = new_balance
 
-    # 2. Portföy Çeşitlendirmeli Alım Mantığı
+    # 2. Dinamik Oranlı Alım Mantığı (En Fazla %20)
     bullish_candidates = df_analysis[
         (df_analysis["is_bullish"] == True)
         & (~df_analysis["pair"].isin(positions.keys()))
@@ -227,17 +227,19 @@ def run_aquiver_bot_cycle():
             ~df_analysis["pair"].isin(positions.keys())
         ]
 
-    # Kasada en az 100 TL varsa işleme gir
     if not bullish_candidates.empty and balance >= 100.0:
         target_buy_coin = bullish_candidates.iloc[0]
         buy_symbol = str(target_buy_coin["pair"])
         buy_price = float(target_buy_coin["last"])
         score = float(target_buy_coin["score"])
 
-        # Toplam Kasanın %20'si ile alım yapılır (Portföyü 5 coin'e böler)
-        # Eğer bakiye azaldıysa kalan tüm bakiyeyi kullanır
+        # Skor Bazlı Dinamik Yüzde Hesaplama (Minimum %5, En Fazla %20)
+        # Sinyal skoru arttıkça oran artar fakat %20 tavanını aşamaz.
+        calculated_pct = 0.05 + (max(score, 0.0) / 100.0) * 0.15
+        buy_pct = min(calculated_pct, 0.20)  # Üst limit maks %20
+
         total_portfolio_value = balance + sum(p["cost"] for p in positions.values())
-        target_trade_amount = total_portfolio_value * 0.20
+        target_trade_amount = total_portfolio_value * buy_pct
         
         buy_amount_try = round(min(balance, target_trade_amount), 2)
 
@@ -259,7 +261,7 @@ def run_aquiver_bot_cycle():
                     "ALIM",
                     f"₺{buy_price:,.2f}",
                     "₺0.00",
-                    f"Portföy %20 Alımı (Skor: {score:.1f})",
+                    f"Portföy %{buy_pct*100:.1f} Alımı (Skor: {score:.1f})",
                 ),
             )
 
@@ -343,7 +345,7 @@ def live_dashboard():
     )
 
     st.markdown("---")
-    st.subheader("🤖 AquiverAI Sanal TRY Portföyü (Çeşitlendirilmiş Mod)")
+    st.subheader("🤖 AquiverAI Sanal TRY Portföyü (Dinamik Esnek Mod)")
     b1, b2, b3, b4 = st.columns(4)
     b1.metric("Kasadaki Sanal Bakiye", f"₺{balance:,.2f}")
     b2.metric("Aktif Açık Pozisyon", len(pos_list))
