@@ -11,7 +11,7 @@ st.set_page_config(
     page_title="BtcTurk AI & AquiverAI 7/24 Bot (TRY)", layout="wide"
 )
 
-st.title("📈 BtcTurk Canlı Analiz & 7/24 Otomatik AquiverAI Botu (TRY - Sınırsız)")
+st.title("📈 BtcTurk Canlı Analiz & 7/24 Otomatik AquiverAI Botu (TRY - Çeşitlendirilmiş)")
 
 # --- VERİTABANI KURULUMU VE YÖNETİMİ ---
 DB_FILE = "aquiver_bot_try.db"
@@ -216,7 +216,7 @@ def run_aquiver_bot_cycle():
                 )
                 balance = new_balance
 
-    # 2. Sınırsız Alım Mantığı (Kasanın Tamamını Kullanabilir)
+    # 2. Portföy Çeşitlendirmeli Alım Mantığı
     bullish_candidates = df_analysis[
         (df_analysis["is_bullish"] == True)
         & (~df_analysis["pair"].isin(positions.keys()))
@@ -227,19 +227,23 @@ def run_aquiver_bot_cycle():
             ~df_analysis["pair"].isin(positions.keys())
         ]
 
-    # Bakiye 10 TL üzerindeyse direkt alım yap
-    if not bullish_candidates.empty and balance >= 10.0:
+    # Kasada en az 100 TL varsa işleme gir
+    if not bullish_candidates.empty and balance >= 100.0:
         target_buy_coin = bullish_candidates.iloc[0]
         buy_symbol = str(target_buy_coin["pair"])
         buy_price = float(target_buy_coin["last"])
         score = float(target_buy_coin["score"])
 
-        # Limit olmaksızın mevcut bakiyenin tamamını kullan
-        buy_amount_try = round(balance, 2)
+        # Toplam Kasanın %20'si ile alım yapılır (Portföyü 5 coin'e böler)
+        # Eğer bakiye azaldıysa kalan tüm bakiyeyi kullanır
+        total_portfolio_value = balance + sum(p["cost"] for p in positions.values())
+        target_trade_amount = total_portfolio_value * 0.20
+        
+        buy_amount_try = round(min(balance, target_trade_amount), 2)
 
-        if buy_amount_try > 0 and buy_price > 0:
+        if buy_amount_try >= 100.0 and buy_price > 0:
             coin_qty = buy_amount_try / buy_price
-            new_balance = 0.0  # Tüm bakiye kullanıldı
+            new_balance = balance - buy_amount_try
 
             cursor.execute(
                 "UPDATE balance SET amount = ? WHERE id = 1", (new_balance,)
@@ -255,7 +259,7 @@ def run_aquiver_bot_cycle():
                     "ALIM",
                     f"₺{buy_price:,.2f}",
                     "₺0.00",
-                    f"Sınırsız Pozisyon Açıldı (Skor: {score:.1f})",
+                    f"Portföy %20 Alımı (Skor: {score:.1f})",
                 ),
             )
 
@@ -339,7 +343,7 @@ def live_dashboard():
     )
 
     st.markdown("---")
-    st.subheader("🤖 AquiverAI Sanal TRY Portföyü (Sınırsız İşlem Modu)")
+    st.subheader("🤖 AquiverAI Sanal TRY Portföyü (Çeşitlendirilmiş Mod)")
     b1, b2, b3, b4 = st.columns(4)
     b1.metric("Kasadaki Sanal Bakiye", f"₺{balance:,.2f}")
     b2.metric("Aktif Açık Pozisyon", len(pos_list))
