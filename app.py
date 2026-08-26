@@ -39,6 +39,17 @@ def init_db():
         )
     """)
 
+    # Eksik sütunları güvenli şekilde ekle
+    try:
+        cursor.execute("ALTER TABLE positions ADD COLUMN highest_price REAL")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE positions ADD COLUMN bought_at DATETIME DEFAULT CURRENT_TIMESTAMP")
+    except sqlite3.OperationalError:
+        pass
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,9 +85,13 @@ def get_db_data():
 
     positions_dict = {}
     for _, row in positions_df.iterrows():
+        entry_p = float(row["entry_price"])
+        h_price = row.get("highest_price")
+        highest_p = float(h_price) if (h_price is not None and not pd.isna(h_price)) else entry_p
+
         positions_dict[row["pair"]] = {
-            "entry_price": float(row["entry_price"]),
-            "highest_price": float(row.get("highest_price", row["entry_price"])),
+            "entry_price": entry_p,
+            "highest_price": highest_p,
             "amount": float(row["amount"]),
             "cost": float(row["cost"]),
             "bought_at": row.get("bought_at", "—"),
@@ -99,7 +114,6 @@ def reset_db():
     conn.close()
 
 
-# API Veri Analiz Fonksiyonu (SADECE TRY)
 def fetch_btcturk_analysis():
     try:
         ticker_url = "https://api.btcturk.com/api/v2/ticker"
@@ -152,11 +166,6 @@ def fetch_btcturk_analysis():
 
 
 def is_market_safe(cursor, is_btc_bullish):
-    """
-    Piyasa güvenliği kontrolü:
-    1. BTC negatifse ALIM YAPMAZ.
-    2. Son 1 saatte 2+ stop varsa VE piyasa henüz toparlanmadıysa ALIM YAPMAZ.
-    """
     if not is_btc_bullish:
         return False
 
@@ -173,7 +182,6 @@ def is_market_safe(cursor, is_btc_bullish):
     return True
 
 
-# --- ARKA PLAN VE ANLIK TRADING MOTORU ---
 def run_aquiver_bot_cycle():
     df_analysis = fetch_btcturk_analysis()
     if df_analysis.empty:
@@ -194,14 +202,18 @@ def run_aquiver_bot_cycle():
     positions = {}
     for _, row in positions_df.iterrows():
         p_coin = row["pair"]
+        entry_p = float(row["entry_price"])
+        h_price = row.get("highest_price")
+        highest_p = float(h_price) if (h_price is not None and not pd.isna(h_price)) else entry_p
+
         positions[p_coin] = {
-            "entry_price": float(row["entry_price"]),
-            "highest_price": float(row.get("highest_price", row["entry_price"])),
+            "entry_price": entry_p,
+            "highest_price": highest_p,
             "amount": float(row["amount"]),
             "cost": float(row["cost"]),
         }
 
-    # 1. Açık Pozisyonların Takibi & İZ SÜREN STOP (TRAILING STOP)
+    # 1. Açık Pozisyonların Takibi & İZ SÜREN STOP
     for pos_coin, pos_data in list(positions.items()):
         coin_match = df_analysis[df_analysis["pair"] == pos_coin]
         if not coin_match.empty:
@@ -212,7 +224,6 @@ def run_aquiver_bot_cycle():
             entry_p = pos_data["entry_price"]
             highest_p = max(pos_data["highest_price"], curr_price)
 
-            # Zirve fiyatı güncelle
             cursor.execute(
                 "UPDATE positions SET highest_price = ? WHERE pair = ?",
                 (highest_p, pos_coin),
@@ -222,7 +233,6 @@ def run_aquiver_bot_cycle():
             current_val = pos_data["amount"] * curr_price
             pnl_amount = current_val - pos_data["cost"]
 
-            # İz süren stop fiyatı (En yüksek seviyeden % stop kadar düşerse satar)
             trailing_stop_price = highest_p * (1 - (s_margin / 100))
 
             if pnl_pct >= p_margin or curr_price <= trailing_stop_price:
@@ -253,11 +263,10 @@ def run_aquiver_bot_cycle():
                 )
                 balance = new_balance
 
-    # 2. Piyasa Düzelme Mantığına Göre Alım Yapma
+    # 2. Alım Mantığı
     btc_match = df_analysis[df_analysis["pair"] == "BTCTRY"]
     is_btc_bullish = btc_match.iloc[0]["is_bullish"] if not btc_match.empty else True
 
-    # Piyasa tamamen güvenli ve toparlanmışsa alım yap
     if is_market_safe(cursor, is_btc_bullish):
         bullish_candidates = df_analysis[
             (df_analysis["is_bullish"] == True)
@@ -304,7 +313,6 @@ def run_aquiver_bot_cycle():
     conn.close()
 
 
-# --- OTOMATİK CANLI EKRAN VE MOTOR DÖNGÜSÜ ---
 @st.fragment(run_every=5)
 def live_dashboard():
     run_aquiver_bot_cycle()
@@ -438,7 +446,6 @@ def live_dashboard():
         st.dataframe(trade_history_df, use_container_width=True)
 
 
-# Sidebar ve Dashboard
 df_initial = fetch_btcturk_analysis()
 if not df_initial.empty:
     pairs_list = df_initial["pair"].tolist()
