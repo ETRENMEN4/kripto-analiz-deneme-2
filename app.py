@@ -9,13 +9,18 @@ import streamlit.components.v1 as components
 
 # Streamlit Arayüz Ayarları
 st.set_page_config(
-    page_title="BtcTurk AI & AquiverAI 7/24 Bot (TRY - Korumalı 20k)", layout="wide"
+    page_title="BtcTurk AI & AquiverAI 7/24 Bot (TRY - Korumalı Dinamik)", layout="wide"
 )
 
-st.title("📈 BtcTurk Canlı Analiz & 7/24 Otomatik AquiverAI Botu (Sabit 20k Tavan + Tam Korumalı)")
+st.title("📈 BtcTurk Canlı Analiz & 7/24 Otomatik AquiverAI Botu (20k Tavan Korumalı)")
 
 # --- VERİTABANI KURULUMU VE YÖNETİMİ ---
 DB_FILE = "aquiver_bot_try.db"
+
+
+def get_current_time_str():
+    """Yerel saat dilimine göre tarih ve saat döndürür."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def init_db():
@@ -29,24 +34,43 @@ def init_db():
         cursor.execute("INSERT INTO balance (id, amount) VALUES (1, 100000.0)")
 
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            id INTEGER PRIMARY KEY,
+            min_buy_amount REAL,
+            max_buy_amount REAL
+        )
+    """)
+    cursor.execute("SELECT COUNT(*) FROM settings")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            "INSERT INTO settings (id, min_buy_amount, max_buy_amount) VALUES (1, 100.0, 20000.0)"
+        )
+
+    try:
+        cursor.execute(
+            "ALTER TABLE settings ADD COLUMN max_buy_amount REAL DEFAULT 20000.0"
+        )
+    except sqlite3.OperationalError:
+        pass
+
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS positions (
             pair TEXT PRIMARY KEY,
             entry_price REAL,
             highest_price REAL,
             amount REAL,
             cost REAL,
-            bought_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            bought_at TEXT
         )
     """)
 
-    # Eksik sütunları güvenli şekilde ekle
     try:
         cursor.execute("ALTER TABLE positions ADD COLUMN highest_price REAL")
     except sqlite3.OperationalError:
         pass
 
     try:
-        cursor.execute("ALTER TABLE positions ADD COLUMN bought_at DATETIME DEFAULT CURRENT_TIMESTAMP")
+        cursor.execute("ALTER TABLE positions ADD COLUMN bought_at TEXT")
     except sqlite3.OperationalError:
         pass
 
@@ -58,7 +82,7 @@ def init_db():
             price TEXT,
             pnl TEXT,
             status TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            timestamp TEXT
         )
     """)
 
@@ -73,6 +97,27 @@ init_db()
 def get_db_data():
     conn = sqlite3.connect(DB_FILE)
     balance = conn.cursor().execute("SELECT amount FROM balance").fetchone()[0]
+
+    try:
+        settings_row = (
+            conn.cursor()
+            .execute(
+                "SELECT min_buy_amount, max_buy_amount FROM settings WHERE id = 1"
+            )
+            .fetchone()
+        )
+        min_buy = (
+            float(settings_row[0])
+            if settings_row and settings_row[0] is not None
+            else 100.0
+        )
+        max_buy = (
+            float(settings_row[1])
+            if settings_row and settings_row[1] is not None
+            else 20000.0
+        )
+    except sqlite3.OperationalError:
+        min_buy, max_buy = 100.0, 20000.0
 
     positions_df = pd.read_sql_query(
         "SELECT * FROM positions WHERE cost > 0 AND amount > 0", conn
@@ -101,6 +146,8 @@ def get_db_data():
         float(balance),
         positions_dict,
         history_df,
+        min_buy,
+        max_buy,
     )
 
 
@@ -132,7 +179,6 @@ def fetch_btcturk_analysis():
                     continue
 
                 volatility = ((high - low) / low) * 100 if low > 0 else 5.0
-                # Hedef kâr marjı minimum %5.0 olarak ayarlandı
                 ai_profit_margin = round(
                     max(5.0, min(volatility / 2, 100.0)), 1
                 )
@@ -170,7 +216,7 @@ def is_market_safe(cursor, is_btc_bullish):
     if not is_btc_bullish:
         return False
 
-    one_hour_ago = datetime.now() - timedelta(hours=1)
+    one_hour_ago = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute(
         "SELECT COUNT(*) FROM history WHERE type='SATIŞ' AND status LIKE '%STOP%' AND timestamp >= ?",
         (one_hour_ago,),
@@ -195,6 +241,10 @@ def run_aquiver_bot_cycle():
     conn.commit()
 
     balance = float(cursor.execute("SELECT amount FROM balance").fetchone()[0])
+
+    # Sabit Tavan Limiti: 20.000 TL
+    min_buy_setting = 100.0
+    max_buy_setting = 20000.0
 
     positions_df = pd.read_sql_query(
         "SELECT * FROM positions WHERE cost > 0 AND amount > 0", conn
@@ -253,18 +303,19 @@ def run_aquiver_bot_cycle():
                 )
                 pnl_sign = "+" if pnl_amount > 0 else ""
                 cursor.execute(
-                    "INSERT INTO history (pair, type, price, pnl, status) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO history (pair, type, price, pnl, status, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         pos_coin,
                         "SATIŞ",
                         f"₺{curr_price:,.2f}",
                         f"{pnl_sign}₺{pnl_amount:,.2f}",
                         status_text,
+                        get_current_time_str(),
                     ),
                 )
                 balance = new_balance
 
-    # 2. Alım Mantığı
+    # 2. Dynamic Alım Mantığı (20k Üst Limitli)
     btc_match = df_analysis[df_analysis["pair"] == "BTCTRY"]
     is_btc_bullish = btc_match.iloc[0]["is_bullish"] if not btc_match.empty else True
 
@@ -279,34 +330,48 @@ def run_aquiver_bot_cycle():
                 ~df_analysis["pair"].isin(positions.keys())
             ]
 
-        if not bullish_candidates.empty and balance >= 100.0:
+        if not bullish_candidates.empty and balance >= min_buy_setting:
             target_buy_coin = bullish_candidates.iloc[0]
             buy_symbol = str(target_buy_coin["pair"])
             buy_price = float(target_buy_coin["last"])
             score = float(target_buy_coin["score"])
 
-            TARGET_MAX_TRADE = 20000.0
-            buy_amount_try = round(min(balance, TARGET_MAX_TRADE), 2)
+            calculated_amount = min_buy_setting + (max(score, 1.0) * 150)
 
-            if buy_amount_try >= 100.0 and buy_price > 0:
+            buy_amount_try = round(
+                min(
+                    max(calculated_amount, min_buy_setting),
+                    max_buy_setting,
+                    balance,
+                ),
+                2,
+            )
+
+            if (
+                buy_amount_try >= min_buy_setting
+                and buy_amount_try <= max_buy_setting
+                and buy_price > 0
+            ):
                 coin_qty = buy_amount_try / buy_price
                 new_balance = balance - buy_amount_try
+                now_str = get_current_time_str()
 
                 cursor.execute(
                     "UPDATE balance SET amount = ? WHERE id = 1", (new_balance,)
                 )
                 cursor.execute(
-                    "INSERT INTO positions (pair, entry_price, highest_price, amount, cost) VALUES (?, ?, ?, ?, ?)",
-                    (buy_symbol, buy_price, buy_price, coin_qty, buy_amount_try),
+                    "INSERT INTO positions (pair, entry_price, highest_price, amount, cost, bought_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (buy_symbol, buy_price, buy_price, coin_qty, buy_amount_try, now_str),
                 )
                 cursor.execute(
-                    "INSERT INTO history (pair, type, price, pnl, status) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO history (pair, type, price, pnl, status, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         buy_symbol,
                         "ALIM",
                         f"₺{buy_price:,.2f}",
                         "₺0.00",
-                        f"Sabit Tavan Alımı (₺{buy_amount_try:,.2f} - Skor: {score:.1f})",
+                        f"AquiverAI Pozisyon Açtı (Skor: {score:.1f})",
+                        now_str,
                     ),
                 )
 
@@ -317,9 +382,11 @@ def run_aquiver_bot_cycle():
 @st.fragment(run_every=5)
 def live_dashboard():
     run_aquiver_bot_cycle()
-
+    
     df_analysis = fetch_btcturk_analysis()
-    balance, bot_positions, trade_history_df = get_db_data()
+    balance, bot_positions, trade_history_df, current_min_buy, current_max_buy = (
+        get_db_data()
+    )
 
     if df_analysis.empty:
         st.warning("BtcTurk API verisi alınamadı, bekleniyor...")
@@ -391,7 +458,7 @@ def live_dashboard():
     btc_status = btc_match.iloc[0]["is_bullish"] if not btc_match.empty else True
 
     st.markdown("---")
-    st.subheader("🤖 AquiverAI Sanal TRY Portföyü (Sabit 20k Tavan + Tam Korumalı)")
+    st.subheader("🤖 AquiverAI Sanal TRY Portföyü (20k Tavan Korumalı)")
     b1, b2, b3, b4 = st.columns(4)
     b1.metric("Kasadaki Sanal Bakiye", f"₺{balance:,.2f}")
     b2.metric("BTC Trend Durumu", "🟢 Pozitif (Alım Açık)" if btc_status else "🔴 Negatif (Piyasa Beklemede)")
