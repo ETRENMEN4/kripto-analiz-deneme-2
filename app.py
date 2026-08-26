@@ -132,10 +132,11 @@ def fetch_btcturk_analysis():
                     continue
 
                 volatility = ((high - low) / low) * 100 if low > 0 else 5.0
+                # Hedef kâr marjı minimum %5.0 olarak ayarlandı
                 ai_profit_margin = round(
-                    max(2.5, min(volatility / 2, 100.0)), 1
+                    max(5.0, min(volatility / 2, 100.0)), 1
                 )
-                ai_stop_margin = round(max(1.5, ai_profit_margin / 2), 1)
+                ai_stop_margin = round(max(2.5, ai_profit_margin / 2), 1)
 
                 mid_price = (high + low) / 2 if (high > 0 and low > 0) else 0
                 is_bullish = last_price >= mid_price if mid_price > 0 else True
