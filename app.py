@@ -1,6 +1,7 @@
 import sqlite3
 import threading
 import time
+from datetime import datetime, timedelta
 import pandas as pd
 import requests
 import streamlit as st
@@ -8,10 +9,10 @@ import streamlit.components.v1 as components
 
 # Streamlit Arayüz Ayarları
 st.set_page_config(
-    page_title="BtcTurk AI & AquiverAI 7/24 Bot (TRY)", layout="wide"
+    page_title="BtcTurk AI & AquiverAI 7/24 Bot (TRY - Korumalı 20k)", layout="wide"
 )
 
-st.title("📈 BtcTurk Canlı Analiz & 7/24 Otomatik AquiverAI Botu (TRY - Sabit 20k Tavan)")
+st.title("📈 BtcTurk Canlı Analiz & 7/24 Otomatik AquiverAI Botu (Sabit 20k Tavan + Tam Korumalı)")
 
 # --- VERİTABANI KURULUMU VE YÖNETİMİ ---
 DB_FILE = "aquiver_bot_try.db"
@@ -31,6 +32,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS positions (
             pair TEXT PRIMARY KEY,
             entry_price REAL,
+            highest_price REAL,
             amount REAL,
             cost REAL,
             bought_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -74,6 +76,7 @@ def get_db_data():
     for _, row in positions_df.iterrows():
         positions_dict[row["pair"]] = {
             "entry_price": float(row["entry_price"]),
+            "highest_price": float(row.get("highest_price", row["entry_price"])),
             "amount": float(row["amount"]),
             "cost": float(row["cost"]),
             "bought_at": row.get("bought_at", "—"),
@@ -148,6 +151,28 @@ def fetch_btcturk_analysis():
         return pd.DataFrame()
 
 
+def is_market_safe(cursor, is_btc_bullish):
+    """
+    Piyasa güvenliği kontrolü:
+    1. BTC negatifse ALIM YAPMAZ.
+    2. Son 1 saatte 2+ stop varsa VE piyasa henüz toparlanmadıysa ALIM YAPMAZ.
+    """
+    if not is_btc_bullish:
+        return False
+
+    one_hour_ago = datetime.now() - timedelta(hours=1)
+    cursor.execute(
+        "SELECT COUNT(*) FROM history WHERE type='SATIŞ' AND status LIKE '%STOP%' AND timestamp >= ?",
+        (one_hour_ago,),
+    )
+    recent_stops = cursor.fetchone()[0]
+
+    if recent_stops >= 2 and not is_btc_bullish:
+        return False
+
+    return True
+
+
 # --- ARKA PLAN VE ANLIK TRADING MOTORU ---
 def run_aquiver_bot_cycle():
     df_analysis = fetch_btcturk_analysis()
@@ -171,11 +196,12 @@ def run_aquiver_bot_cycle():
         p_coin = row["pair"]
         positions[p_coin] = {
             "entry_price": float(row["entry_price"]),
+            "highest_price": float(row.get("highest_price", row["entry_price"])),
             "amount": float(row["amount"]),
             "cost": float(row["cost"]),
         }
 
-    # 1. Açık Pozisyonların Takibi & Kâr/Zarar Satışı
+    # 1. Açık Pozisyonların Takibi & İZ SÜREN STOP (TRAILING STOP)
     for pos_coin, pos_data in list(positions.items()):
         coin_match = df_analysis[df_analysis["pair"] == pos_coin]
         if not coin_match.empty:
@@ -184,11 +210,22 @@ def run_aquiver_bot_cycle():
             s_margin = float(coin_match.iloc[0]["stop_margin"])
 
             entry_p = pos_data["entry_price"]
+            highest_p = max(pos_data["highest_price"], curr_price)
+
+            # Zirve fiyatı güncelle
+            cursor.execute(
+                "UPDATE positions SET highest_price = ? WHERE pair = ?",
+                (highest_p, pos_coin),
+            )
+
             pnl_pct = ((curr_price - entry_p) / entry_p) * 100
             current_val = pos_data["amount"] * curr_price
             pnl_amount = current_val - pos_data["cost"]
 
-            if pnl_pct >= p_margin or pnl_pct <= -s_margin:
+            # İz süren stop fiyatı (En yüksek seviyeden % stop kadar düşerse satar)
+            trailing_stop_price = highest_p * (1 - (s_margin / 100))
+
+            if pnl_pct >= p_margin or curr_price <= trailing_stop_price:
                 new_balance = balance + current_val
                 cursor.execute(
                     "UPDATE balance SET amount = ? WHERE id = 1",
@@ -201,7 +238,7 @@ def run_aquiver_bot_cycle():
                 status_text = (
                     "KÂR İLE KAPATILDI"
                     if pnl_amount > 0
-                    else "ZARAR KES (STOP) YAPILDI"
+                    else "İZ SÜREN STOP YAPILDI"
                 )
                 pnl_sign = "+" if pnl_amount > 0 else ""
                 cursor.execute(
@@ -216,49 +253,52 @@ def run_aquiver_bot_cycle():
                 )
                 balance = new_balance
 
-    # 2. Maksimum 20.000 TL Tavanlı Alım Mantığı
-    bullish_candidates = df_analysis[
-        (df_analysis["is_bullish"] == True)
-        & (~df_analysis["pair"].isin(positions.keys()))
-    ]
+    # 2. Piyasa Düzelme Mantığına Göre Alım Yapma
+    btc_match = df_analysis[df_analysis["pair"] == "BTCTRY"]
+    is_btc_bullish = btc_match.iloc[0]["is_bullish"] if not btc_match.empty else True
 
-    if bullish_candidates.empty:
+    # Piyasa tamamen güvenli ve toparlanmışsa alım yap
+    if is_market_safe(cursor, is_btc_bullish):
         bullish_candidates = df_analysis[
-            ~df_analysis["pair"].isin(positions.keys())
+            (df_analysis["is_bullish"] == True)
+            & (~df_analysis["pair"].isin(positions.keys()))
         ]
 
-    # Kasada kullanılabilir bakiye varsa işleme gir
-    if not bullish_candidates.empty and balance >= 100.0:
-        target_buy_coin = bullish_candidates.iloc[0]
-        buy_symbol = str(target_buy_coin["pair"])
-        buy_price = float(target_buy_coin["last"])
-        score = float(target_buy_coin["score"])
+        if bullish_candidates.empty:
+            bullish_candidates = df_analysis[
+                ~df_analysis["pair"].isin(positions.keys())
+            ]
 
-        # Kasadaki bakiye 20.000 TL veya üstüyse 20.000 TL, altındaysa kalan tüm bakiyeyi kullanır.
-        TARGET_MAX_TRADE = 20000.0
-        buy_amount_try = round(min(balance, TARGET_MAX_TRADE), 2)
+        if not bullish_candidates.empty and balance >= 100.0:
+            target_buy_coin = bullish_candidates.iloc[0]
+            buy_symbol = str(target_buy_coin["pair"])
+            buy_price = float(target_buy_coin["last"])
+            score = float(target_buy_coin["score"])
 
-        if buy_amount_try >= 100.0 and buy_price > 0:
-            coin_qty = buy_amount_try / buy_price
-            new_balance = balance - buy_amount_try
+            TARGET_MAX_TRADE = 20000.0
+            buy_amount_try = round(min(balance, TARGET_MAX_TRADE), 2)
 
-            cursor.execute(
-                "UPDATE balance SET amount = ? WHERE id = 1", (new_balance,)
-            )
-            cursor.execute(
-                "INSERT INTO positions (pair, entry_price, amount, cost) VALUES (?, ?, ?, ?)",
-                (buy_symbol, buy_price, coin_qty, buy_amount_try),
-            )
-            cursor.execute(
-                "INSERT INTO history (pair, type, price, pnl, status) VALUES (?, ?, ?, ?, ?)",
-                (
-                    buy_symbol,
-                    "ALIM",
-                    f"₺{buy_price:,.2f}",
-                    "₺0.00",
-                    f"Sabit Tavan Alımı (₺{buy_amount_try:,.2f} - Skor: {score:.1f})",
-                ),
-            )
+            if buy_amount_try >= 100.0 and buy_price > 0:
+                coin_qty = buy_amount_try / buy_price
+                new_balance = balance - buy_amount_try
+
+                cursor.execute(
+                    "UPDATE balance SET amount = ? WHERE id = 1", (new_balance,)
+                )
+                cursor.execute(
+                    "INSERT INTO positions (pair, entry_price, highest_price, amount, cost) VALUES (?, ?, ?, ?, ?)",
+                    (buy_symbol, buy_price, buy_price, coin_qty, buy_amount_try),
+                )
+                cursor.execute(
+                    "INSERT INTO history (pair, type, price, pnl, status) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        buy_symbol,
+                        "ALIM",
+                        f"₺{buy_price:,.2f}",
+                        "₺0.00",
+                        f"Sabit Tavan Alımı (₺{buy_amount_try:,.2f} - Skor: {score:.1f})",
+                    ),
+                )
 
     conn.commit()
     conn.close()
@@ -284,7 +324,6 @@ def live_dashboard():
     if st.session_state.selected_coin not in pairs_list:
         st.session_state.selected_coin = pairs_list[0]
 
-    # --- TOPLAM KÂR/ZARAR HESAPLAMASI VE POZİSYONLAR ---
     total_unrealized_pnl = 0.0
     total_positions_current_val = 0.0
     pos_list = []
@@ -339,11 +378,14 @@ def live_dashboard():
         coin_data["low"],
     )
 
+    btc_match = df_analysis[df_analysis["pair"] == "BTCTRY"]
+    btc_status = btc_match.iloc[0]["is_bullish"] if not btc_match.empty else True
+
     st.markdown("---")
-    st.subheader("🤖 AquiverAI Sanal TRY Portföyü (Sabit 20k Tavan Modu)")
+    st.subheader("🤖 AquiverAI Sanal TRY Portföyü (Sabit 20k Tavan + Tam Korumalı)")
     b1, b2, b3, b4 = st.columns(4)
     b1.metric("Kasadaki Sanal Bakiye", f"₺{balance:,.2f}")
-    b2.metric("Aktif Açık Pozisyon", len(pos_list))
+    b2.metric("BTC Trend Durumu", "🟢 Pozitif (Alım Açık)" if btc_status else "🔴 Negatif (Piyasa Beklemede)")
 
     unrealized_sign = "+" if total_unrealized_pnl > 0 else ""
     b3.metric(
@@ -368,12 +410,10 @@ def live_dashboard():
 
     st.markdown("---")
 
-    # BtcTurk Bilgi Kutusu
     st.success(
         f"📊 **BtcTurk Hesabınızın Toplam Tahmini Değeri: ₺{total_portfolio_val:,.2f}**"
     )
 
-    # --- AKTİF AÇIK POZİSYONLAR TABLOSU ---
     if pos_list:
         st.subheader("⚡ Aktif Açık Pozisyonlar & Hedef / Stop Seviyeleri")
 
