@@ -7,10 +7,10 @@ import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="BtcTurk 7/24 Bot (BTC Trend Korumalı)", layout="wide"
+    page_title="BtcTurk 7/24 Bot (BTC + Piyasa Duygu Korumalı)", layout="wide"
 )
 
-st.title("📈 BtcTurk 7/24 Kesintisiz Bot (BTC Trend Takip Sistemli)")
+st.title("📈 BtcTurk 7/24 Kesintisiz Bot (BTC Trend + Korku & Açgözlülük Sistemli)")
 
 DB_FILE = "aquiver_bot_try.db"
 
@@ -90,6 +90,18 @@ def reset_db():
     conn.commit()
     conn.close()
 
+def fetch_fear_and_greed():
+    """Crypto Fear & Greed Index API'sinden güncel duygu durumunu çeker."""
+    try:
+        url = "https://api.alternative.me/fng/?limit=1"
+        res = requests.get(url, timeout=5).json()
+        data = res.get("data", [])[0]
+        val = int(data.get("value", 50))
+        classification = str(data.get("value_classification", "Neutral"))
+        return val, classification
+    except Exception:
+        return 50, "Neutral"
+
 def fetch_btcturk_analysis():
     try:
         ticker_url = "https://api.btcturk.com/api/v2/ticker"
@@ -139,16 +151,22 @@ def run_aquiver_bot_cycle():
     if df_analysis.empty:
         return
 
+    fg_val, fg_status = fetch_fear_and_greed()
+
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
     balance = float(cursor.execute("SELECT amount FROM balance").fetchone()[0])
-    TARGET_BUY_AMOUNT = 20000.0  # Hedeflanan sabit alım
-    MIN_BUY_LIMIT = 100.0        # Minimum işleme girme limiti
+    TARGET_BUY_AMOUNT = 20000.0
+    MIN_BUY_LIMIT = 100.0
 
     # BTC Trend Kontrolü
     btc_match = df_analysis[df_analysis["pair"] == "BTCTRY"]
     is_btc_bullish = btc_match.iloc[0]["is_bullish"] if not btc_match.empty else True
+
+    # Genel Piyasa Güvenliği Mantığı (BTC Bullish + Piyasa Şişmemiş veya Çökmemiş Olmalı)
+    # Fear & Greed > 80 (Aşırı Şişkinlik/Düzeltme Riski) veya < 20 (Aşırı Çöküş Paniği) ise alım kilitlenir.
+    is_market_safe = is_btc_bullish and (20 <= fg_val <= 80)
 
     positions_df = pd.read_sql_query("SELECT * FROM positions WHERE cost > 0 AND amount > 0", conn)
     positions = {}
@@ -160,7 +178,7 @@ def run_aquiver_bot_cycle():
             "cost": float(row["cost"]),
         }
 
-    # 1. Pozisyon Takibi, İz Süren Stop & BTC Trend Koruması
+    # 1. Pozisyon Takibi & Risk Yönetimi Satışları
     for pos_coin, pos_data in list(positions.items()):
         coin_match = df_analysis[df_analysis["pair"] == pos_coin]
         if not coin_match.empty:
@@ -187,9 +205,10 @@ def run_aquiver_bot_cycle():
             elif curr_price <= trailing_stop_price:
                 should_sell = True
                 status_text = "İZ SÜREN STOP YAPILDI"
-            elif not is_btc_bullish and pnl_pct < 0:
+            elif (not is_btc_bullish or fg_val < 20) and pnl_pct < 0:
+                # BTC trendi bozulduysa veya piyasada panik satışı (Extreme Fear) varsa zarardaki pozisyonu kapat
                 should_sell = True
-                status_text = "BTC TREND STOP (AYI PİYASASI)"
+                status_text = "PİYASA RİSK STOP (BTC/KORKU)"
 
             if should_sell:
                 new_balance = balance + current_val
@@ -203,8 +222,8 @@ def run_aquiver_bot_cycle():
                 )
                 balance = new_balance
 
-    # 2. BTC Trend Bazlı Alım Mantığı
-    if is_btc_bullish and balance >= MIN_BUY_LIMIT:
+    # 2. Akıllı Alım Mantığı (Güvenlik Filtresi Onaylıysa)
+    if is_market_safe and balance >= MIN_BUY_LIMIT:
         bullish_candidates = df_analysis[
             (df_analysis["is_bullish"] == True) & (~df_analysis["pair"].isin(positions.keys()))
         ]
@@ -256,6 +275,7 @@ if "bot_thread_started" not in st.session_state:
 def live_dashboard():
     df_analysis = fetch_btcturk_analysis()
     balance, bot_positions, trade_history_df = get_db_data()
+    fg_val, fg_status = fetch_fear_and_greed()
 
     if df_analysis.empty:
         st.warning("BtcTurk API verisi bekleniyor...")
@@ -302,12 +322,15 @@ def live_dashboard():
     net_total_pnl = total_portfolio_val - 100000.0
 
     st.markdown("---")
-    st.subheader("🤖 AquiverAI Sanal Portföy (BTC Trend Korumalı)")
-    b1, b2, b3, b4 = st.columns(4)
+    st.subheader("🤖 AquiverAI Sanal PortföY (Çift Katmanlı Risk Korumalı)")
+    
+    # Metrikleri 5 Kolona Yaydık (Fear & Greed Eklenmiştir)
+    b1, b2, b3, b4, b5 = st.columns(5)
     b1.metric("Kasadaki Sanal Bakiye", f"₺{balance:,.2f}")
-    b2.metric("BTC Trend Durumu", "🟢 Boğa (Alım Açık)" if btc_status else "🔴 Ayı (Alımlar Kapalı)")
-    b3.metric("Açık Pozisyonlar Kâr/Zarar", f"₺{total_unrealized_pnl:,.2f}")
-    b4.metric("Genel Toplam Kâr/Zarar", f"₺{net_total_pnl:,.2f}")
+    b2.metric("BTC Trend Durumu", "🟢 Boğa" if btc_status else "🔴 Ayı")
+    b3.metric("Korku & Açgözlülük", f"{fg_val}/100 ({fg_status})")
+    b4.metric("Açık Pozisyon K/Z", f"₺{total_unrealized_pnl:,.2f}")
+    b5.metric("Genel Toplam K/Z", f"₺{net_total_pnl:,.2f}")
 
     if pos_list:
         st.subheader("⚡ Aktif Açık Pozisyonlar")
