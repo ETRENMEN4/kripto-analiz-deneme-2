@@ -143,7 +143,7 @@ def run_aquiver_bot_cycle():
     cursor = conn.cursor()
 
     balance = float(cursor.execute("SELECT amount FROM balance").fetchone()[0])
-    TARGET_BUY_AMOUNT = 20000.0  # Hedeflenen sabit alım
+    TARGET_BUY_AMOUNT = 20000.0  # Hedeflanan sabit alım
     MIN_BUY_LIMIT = 100.0        # Minimum işleme girme limiti
 
     # BTC Trend Kontrolü
@@ -178,7 +178,6 @@ def run_aquiver_bot_cycle():
             pnl_amount = current_val - pos_data["cost"]
             trailing_stop_price = highest_p * (1 - (s_margin / 100))
 
-            # Satış Koşulları: Kâr Al / İz Süren Stop / BTC Trendi Bozulduysa Erken Çıkış
             should_sell = False
             status_text = ""
 
@@ -189,7 +188,6 @@ def run_aquiver_bot_cycle():
                 should_sell = True
                 status_text = "İZ SÜREN STOP YAPILDI"
             elif not is_btc_bullish and pnl_pct < 0:
-                # BTC Trendi ayıya döndüyse ve pozisyon zarardaysa daha fazla düşüşten kaçınmak için kapat
                 should_sell = True
                 status_text = "BTC TREND STOP (AYI PİYASASI)"
 
@@ -206,7 +204,6 @@ def run_aquiver_bot_cycle():
                 balance = new_balance
 
     # 2. BTC Trend Bazlı Alım Mantığı
-    # BTC Trendi Pozitif (Bullish) DEĞİLSE Alım Yapma!
     if is_btc_bullish and balance >= MIN_BUY_LIMIT:
         bullish_candidates = df_analysis[
             (df_analysis["is_bullish"] == True) & (~df_analysis["pair"].isin(positions.keys()))
@@ -280,6 +277,10 @@ def live_dashboard():
             entry_p = float(p_data["entry_price"])
             cost_p = float(p_data["cost"])
 
+            # Hedef Kâr ve Stop Loss TL Tutarları Hesaplama
+            target_tp_tl = cost_p * (p_margin / 100)
+            target_sl_tl = cost_p * (s_margin / 100)
+
             c_val = p_data["amount"] * c_price
             pnl = c_val - cost_p
             total_unrealized_pnl += pnl
@@ -291,8 +292,8 @@ def live_dashboard():
                 "Alış Fiyatı": f"₺{entry_p:,.2f}",
                 "Güncel Fiyat": f"₺{c_price:,.2f}",
                 "Yatırılan Tutar": f"₺{cost_p:,.2f}",
-                "Hedef Kâr": f"%{p_margin:.1f}",
-                "Stop Loss": f"-%{s_margin:.1f}",
+                "Hedef Kâr (% / ₺)": f"%{p_margin:.1f} (+₺{target_tp_tl:,.2f})",
+                "Stop Loss (% / ₺)": f"-%{s_margin:.1f} (-₺{target_sl_tl:,.2f})",
                 "Anlık Kâr/Zarar": f"{pnl_sign}₺{pnl:,.2f}",
                 "Alım Zamanı": p_data.get("bought_at", "—"),
             })
@@ -301,7 +302,7 @@ def live_dashboard():
     net_total_pnl = total_portfolio_val - 100000.0
 
     st.markdown("---")
-    st.subheader("🤖 AquiverAI Sanal PortföY (BTC Trend Korumalı)")
+    st.subheader("🤖 AquiverAI Sanal Portföy (BTC Trend Korumalı)")
     b1, b2, b3, b4 = st.columns(4)
     b1.metric("Kasadaki Sanal Bakiye", f"₺{balance:,.2f}")
     b2.metric("BTC Trend Durumu", "🟢 Boğa (Alım Açık)" if btc_status else "🔴 Ayı (Alımlar Kapalı)")
