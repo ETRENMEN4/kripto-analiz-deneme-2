@@ -7,10 +7,10 @@ import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="BtcTurk 7/24 Bot (Sabit 20k / Esnek Kalan Bakiye)", layout="wide"
+    page_title="BtcTurk 7/24 Bot (BTC Trend Korumalı)", layout="wide"
 )
 
-st.title("📈 BtcTurk 7/24 Kesintisiz Bot (Sabit 20k & Kalan Bakiye Alımı)")
+st.title("📈 BtcTurk 7/24 Kesintisiz Bot (BTC Trend Takip Sistemli)")
 
 DB_FILE = "aquiver_bot_try.db"
 
@@ -144,7 +144,11 @@ def run_aquiver_bot_cycle():
 
     balance = float(cursor.execute("SELECT amount FROM balance").fetchone()[0])
     TARGET_BUY_AMOUNT = 20000.0  # Hedeflenen sabit alım
-    MIN_BUY_LIMIT = 100.0       # Minimum işleme girme limiti
+    MIN_BUY_LIMIT = 100.0        # Minimum işleme girme limiti
+
+    # BTC Trend Kontrolü
+    btc_match = df_analysis[df_analysis["pair"] == "BTCTRY"]
+    is_btc_bullish = btc_match.iloc[0]["is_bullish"] if not btc_match.empty else True
 
     positions_df = pd.read_sql_query("SELECT * FROM positions WHERE cost > 0 AND amount > 0", conn)
     positions = {}
@@ -156,7 +160,7 @@ def run_aquiver_bot_cycle():
             "cost": float(row["cost"]),
         }
 
-    # 1. Pozisyon Takibi & İz Süren Stop
+    # 1. Pozisyon Takibi, İz Süren Stop & BTC Trend Koruması
     for pos_coin, pos_data in list(positions.items()):
         coin_match = df_analysis[df_analysis["pair"] == pos_coin]
         if not coin_match.empty:
@@ -174,12 +178,26 @@ def run_aquiver_bot_cycle():
             pnl_amount = current_val - pos_data["cost"]
             trailing_stop_price = highest_p * (1 - (s_margin / 100))
 
-            if pnl_pct >= p_margin or curr_price <= trailing_stop_price:
+            # Satış Koşulları: Kâr Al / İz Süren Stop / BTC Trendi Bozulduysa Erken Çıkış
+            should_sell = False
+            status_text = ""
+
+            if pnl_pct >= p_margin:
+                should_sell = True
+                status_text = "KÂR İLE KAPATILDI"
+            elif curr_price <= trailing_stop_price:
+                should_sell = True
+                status_text = "İZ SÜREN STOP YAPILDI"
+            elif not is_btc_bullish and pnl_pct < 0:
+                # BTC Trendi ayıya döndüyse ve pozisyon zarardaysa daha fazla düşüşten kaçınmak için kapat
+                should_sell = True
+                status_text = "BTC TREND STOP (AYI PİYASASI)"
+
+            if should_sell:
                 new_balance = balance + current_val
                 cursor.execute("UPDATE balance SET amount = ? WHERE id = 1", (new_balance,))
                 cursor.execute("DELETE FROM positions WHERE pair = ?", (pos_coin,))
 
-                status_text = "KÂR İLE KAPATILDI" if pnl_amount > 0 else "İZ SÜREN STOP YAPILDI"
                 pnl_sign = "+" if pnl_amount > 0 else ""
                 cursor.execute(
                     "INSERT INTO history (pair, type, price, pnl, status, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
@@ -187,10 +205,8 @@ def run_aquiver_bot_cycle():
                 )
                 balance = new_balance
 
-    # 2. Esnek Alım Mantığı (20k veya Kalan Son Bakiye)
-    btc_match = df_analysis[df_analysis["pair"] == "BTCTRY"]
-    is_btc_bullish = btc_match.iloc[0]["is_bullish"] if not btc_match.empty else True
-
+    # 2. BTC Trend Bazlı Alım Mantığı
+    # BTC Trendi Pozitif (Bullish) DEĞİLSE Alım Yapma!
     if is_btc_bullish and balance >= MIN_BUY_LIMIT:
         bullish_candidates = df_analysis[
             (df_analysis["is_bullish"] == True) & (~df_analysis["pair"].isin(positions.keys()))
@@ -202,7 +218,6 @@ def run_aquiver_bot_cycle():
             buy_price = float(target_buy_coin["last"])
             score = float(target_buy_coin["score"])
 
-            # 20.000 TL varsa 20.000 TL, daha azı kaldıysa kalan tüm bakiyeyi harcar
             actual_buy_amount = min(TARGET_BUY_AMOUNT, balance)
 
             if actual_buy_amount >= MIN_BUY_LIMIT and buy_price > 0:
@@ -249,6 +264,9 @@ def live_dashboard():
         st.warning("BtcTurk API verisi bekleniyor...")
         return
 
+    btc_match = df_analysis[df_analysis["pair"] == "BTCTRY"]
+    btc_status = btc_match.iloc[0]["is_bullish"] if not btc_match.empty else True
+
     total_unrealized_pnl = 0.0
     total_positions_current_val = 0.0
     pos_list = []
@@ -283,10 +301,10 @@ def live_dashboard():
     net_total_pnl = total_portfolio_val - 100000.0
 
     st.markdown("---")
-    st.subheader("🤖 AquiverAI Sanal Portföy (20k & Kalan Bakiye Modu)")
+    st.subheader("🤖 AquiverAI Sanal PortföY (BTC Trend Korumalı)")
     b1, b2, b3, b4 = st.columns(4)
     b1.metric("Kasadaki Sanal Bakiye", f"₺{balance:,.2f}")
-    b2.metric("Hedef Alım Tutarı", "₺20,000.00")
+    b2.metric("BTC Trend Durumu", "🟢 Boğa (Alım Açık)" if btc_status else "🔴 Ayı (Alımlar Kapalı)")
     b3.metric("Açık Pozisyonlar Kâr/Zarar", f"₺{total_unrealized_pnl:,.2f}")
     b4.metric("Genel Toplam Kâr/Zarar", f"₺{net_total_pnl:,.2f}")
 
